@@ -33,15 +33,36 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Restore previous price
-        env:
-          GH_TOKEN: ${{ github.token }}
+        continue-on-error: true
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const response = await github.rest.actions.listArtifactsForRepo({
+              owner,
+              repo,
+              name: "gold-price-state",
+              per_page: 1,
+            });
+            const artifact = response.data.artifacts[0];
+            if (!artifact) {
+              core.info("No previous state artifact is available yet.");
+              return;
+            }
+            const archive = await github.rest.actions.downloadArtifact({
+              owner,
+              repo,
+              artifact_id: artifact.id,
+              archive_format: "zip",
+            });
+            require("fs").writeFileSync("state.zip", Buffer.from(archive.data));
+
+      - name: Load previous state
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p state
-          artifact_id="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=gold-price-state&per_page=1" --jq '.artifacts[0].id // empty')"
-          if [[ -n "$artifact_id" ]]; then
-            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > state.zip
+          if [[ -s state.zip ]]; then
             unzip -oq state.zip -d state
           fi
           if [[ -s state/last_price.txt ]]; then
@@ -77,12 +98,22 @@ jobs:
           retention-days: 1
 
       - name: Remove older state artifacts
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=gold-price-state&per_page=100" \
-            --jq '.artifacts[1:][].id' | while read -r artifact_id; do
-              [[ -z "$artifact_id" ]] || gh api --method DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}"
-            done
+        continue-on-error: true
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const response = await github.rest.actions.listArtifactsForRepo({
+              owner,
+              repo,
+              name: "gold-price-state",
+              per_page: 100,
+            });
+            for (const artifact of response.data.artifacts.slice(1)) {
+              await github.rest.actions.deleteArtifact({
+                owner,
+                repo,
+                artifact_id: artifact.id,
+              });
+            }
+
