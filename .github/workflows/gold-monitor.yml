@@ -26,6 +26,126 @@ jobs:
     env:
       QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
       QQ_SMTP_AUTH_CODE: ${{ secrets.QQ_SMTP_AUTH_CODE }}
+      PORTFOLIO_JSON: ${{ secrets.PORTFOLIO_JSON }}
+      FORCE_TEST_EMAIL: ${{ inputs.send_test_email || 'false' }}
+
+    steps:
+      - name: Check out monitor
+        uses: actions/checkout@v4
+
+      - name: Restore previous price
+        continue-on-error: true
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const response = await github.rest.actions.listArtifactsForRepo({
+              owner,
+              repo,
+              name: "gold-price-state",
+              per_page: 1,
+            });
+            const artifact = response.data.artifacts[0];
+            if (!artifact) {
+              core.info("No previous state artifact is available yet.");
+              return;
+            }
+            const archive = await github.rest.actions.downloadArtifact({
+              owner,
+              repo,
+              artifact_id: artifact.id,
+              archive_format: "zip",
+            });
+            require("fs").writeFileSync("state.zip", Buffer.from(archive.data));
+
+      - name: Load previous state
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p state
+          if [[ -s state.zip ]]; then
+            unzip -oq state.zip -d state
+          fi
+          if [[ -s state/last_price.txt ]]; then
+            echo "LAST_PRICE=$(cat state/last_price.txt)" >> "$GITHUB_ENV"
+          fi
+          if [[ -s state/last_source_kind.txt ]]; then
+            echo "LAST_SOURCE_KIND=$(cat state/last_source_kind.txt)" >> "$GITHUB_ENV"
+          fi
+          if [[ -s state/last_news_id.txt ]]; then
+            echo "LAST_NEWS_ID=$(cat state/last_news_id.txt)" >> "$GITHUB_ENV"
+          fi
+
+      - name: Check price and notify
+        id: monitor
+        run: python monitor.py
+
+      - name: Prepare latest state
+        env:
+          CURRENT_PRICE: ${{ steps.monitor.outputs.price }}
+          CURRENT_SOURCE_KIND: ${{ steps.monitor.outputs.source_kind }}
+          CURRENT_NEWS_ID: ${{ steps.monitor.outputs.news_id }}
+        shell: bash
+        run: |
+          printf '%s' "$CURRENT_PRICE" > state/last_price.txt
+          printf '%s' "$CURRENT_SOURCE_KIND" > state/last_source_kind.txt
+          printf '%s' "$CURRENT_NEWS_ID" > state/last_news_id.txt
+
+      - name: Save price for the next run
+        uses: actions/upload-artifact@v4
+        with:
+          name: gold-price-state
+          path: state/
+          retention-days: 1
+
+      - name: Remove older state artifacts
+        continue-on-error: true
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const response = await github.rest.actions.listArtifactsForRepo({
+              owner,
+              repo,
+              name: "gold-price-state",
+              per_page: 100,
+            });
+            for (const artifact of response.data.artifacts.slice(1)) {
+              await github.rest.actions.deleteArtifact({
+                owner,
+                repo,
+                artifact_id: artifact.id,
+              });
+            }
+
+name: Gold CNY monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      send_test_email:
+        description: Send a test email even when the threshold is not reached
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: gold-cny-monitor
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
+      QQ_SMTP_AUTH_CODE: ${{ secrets.QQ_SMTP_AUTH_CODE }}
       FORCE_TEST_EMAIL: ${{ inputs.send_test_email || 'false' }}
 
     steps:
