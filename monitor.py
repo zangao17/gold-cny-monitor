@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from email.header import Header
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
-from html import unescape
+from html import escape, unescape
 from zoneinfo import ZoneInfo
 
 
@@ -205,12 +205,29 @@ def build_portfolio_report(portfolio, quote):
             "\u505c\u6b62\u52a0\u4ed3\uff0c\u68c0\u67e5\u6301\u4ed3\u662f\u5426\u9700\u8981\u5206\u6279\u964d\u4f4e\u3002"
         )
     elif allocation >= 40:
-        risk_code = "high_allocation"
+        risk_code = "high_allocation_plan_v1"
+        target_allocation = 35.0
         action = (
             "\u9ec4\u91d1\u5360\u53ef\u6295\u8d44\u8d44\u4ea7\u7ea6 "
             f"{allocation:.0f}%\uff0c\u4e0e\u7a33\u5065\u578b\u548c\u6700\u5927\u53ef\u63a5\u53d7\u4e8f\u635f "
-            f"{max_loss:.0f}% \u4e0d\u592a\u5339\u914d\uff1a\u6682\u505c\u52a0\u4ed3\uff0c\u4f18\u5148\u6301\u6709\u6216\u5206\u6279\u964d\u4f4e\u96c6\u4e2d\u5ea6\u3002"
+            f"{max_loss:.0f}% \u4e0d\u592a\u5339\u914d\uff1a\u6682\u505c\u52a0\u4ed3\u3002"
         )
+        if combined_value is not None and fund:
+            reduction_value = combined_value * (1 - target_allocation / allocation)
+            reduction_shares = min(fund_shares, reduction_value / fund["nav"])
+            action += (
+                f"\u82e5\u8981\u628a\u5360\u6bd4\u9010\u6b65\u964d\u5230\u7ea6 {target_allocation:.0f}%\uff0c"
+                f"\u53c2\u8003\u51cf\u5c11\u7ea6 {reduction_value:.0f} \u5143\uff0c"
+                f"\u7ea6\u7b49\u4e8e\u57fa\u91d1 {reduction_shares:.0f} \u4efd\uff1b"
+                f"\u53ef\u5206 3 \u6b21\uff0c\u6bcf\u6b21\u7ea6 {reduction_value / 3:.0f} \u5143/"
+                f"{reduction_shares / 3:.0f} \u4efd\u3002"
+            )
+            if float(portfolio.get("fund_redemption_fee_pct", 0)) == 0:
+                action += (
+                    "\u4f18\u5148\u8003\u8651\u5df2\u6301\u6709\u8d85\u8fc7 30 \u5929\u3001"
+                    "\u5f53\u524d\u4f30\u7b97\u8d4e\u56de\u8d39\u4e3a 0% \u7684\u57fa\u91d1\u3002"
+                )
+        action += "\u4e0d\u56e0\u5355\u6b21 5 \u5206\u949f\u6da8\u8dcc\u76f4\u63a5\u4ea4\u6613\u3002"
     else:
         risk_code = "normal"
         action = "\u4ed3\u4f4d\u672a\u89e6\u53d1\u98ce\u9669\u7ebf\uff1a\u4ee5\u6301\u6709\u89c2\u5bdf\u4e3a\u4e3b\uff0c\u907f\u514d\u8ffd\u6da8\u3002"
@@ -252,9 +269,23 @@ def build_portfolio_report(portfolio, quote):
     return {
         "text": "\n".join(lines),
         "combined_return": combined_return,
+        "combined_value": combined_value,
+        "combined_profit": combined_profit,
         "allocation": allocation,
         "action": action,
         "risk_code": risk_code,
+        "fund": fund,
+        "fund_name": portfolio["fund_name"],
+        "fund_code": portfolio["fund_code"],
+        "fund_shares": fund_shares,
+        "fund_value": fund_value,
+        "fund_profit": fund_profit,
+        "fund_return": fund_return,
+        "gold_grams": gold_grams,
+        "gold_mark": gold_mark,
+        "gold_value": gold_value,
+        "gold_profit": gold_profit,
+        "gold_return": gold_return,
     }
 
 
@@ -285,7 +316,127 @@ def fetch_important_news(now):
     return None
 
 
-def send_email(subject, body):
+def build_email_html(quote, change, change_ratio, timestamp, portfolio_report, reasons, news):
+    def value_color(value):
+        if value is None or value == 0:
+            return "#4b5563"
+        return "#087f5b" if value > 0 else "#c92a2a"
+
+    if change is None:
+        change_value = "--"
+        change_percent = "\u9996\u6b21\u68c0\u67e5"
+    else:
+        change_value = f"{change:+.2f} \u5143/\u514b"
+        change_percent = f"{change_ratio:+.2%}"
+    change_color = value_color(change)
+    estimate_note = " (\u4f30\u7b97)" if quote["estimated"] else ""
+
+    holdings_html = ""
+    action_html = ""
+    note_html = ""
+    if portfolio_report:
+        fund_return = portfolio_report["fund_return"]
+        if portfolio_report["fund"]:
+            fund_metrics = (
+                f"<strong>{portfolio_report['fund_value']:,.2f} \u5143</strong><br>"
+                f"<span style=\"color:{value_color(portfolio_report['fund_profit'])}\">"
+                f"{portfolio_report['fund_profit']:+,.2f} \u5143 "
+                f"({fund_return:+.2%})</span>"
+            )
+            fund_detail = (
+                f"{portfolio_report['fund_shares']:,.2f} \u4efd<br>"
+                f"\u51c0\u503c {portfolio_report['fund']['nav']:.4f} "
+                f"({escape(portfolio_report['fund']['date'])})"
+            )
+        else:
+            fund_metrics = "\u51c0\u503c\u6682\u4e0d\u53ef\u7528"
+            fund_detail = f"{portfolio_report['fund_shares']:,.2f} \u4efd"
+
+        if portfolio_report["combined_value"] is not None:
+            combined_metrics = (
+                f"<strong>{portfolio_report['combined_value']:,.2f} \u5143</strong><br>"
+                f"<span style=\"color:{value_color(portfolio_report['combined_profit'])}\">"
+                f"{portfolio_report['combined_profit']:+,.2f} \u5143 "
+                f"({portfolio_report['combined_return']:+.2%})</span>"
+            )
+        else:
+            combined_metrics = "\u57fa\u91d1\u51c0\u503c\u7f3a\u5931\uff0c\u6682\u4e0d\u8ba1\u7b97"
+
+        holdings_html = f"""
+          <h2 style="margin:28px 0 10px;font-size:18px;color:#1f2933;">\u6301\u4ed3\u6982\u89c8</h2>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #d9dee5;font-size:14px;">
+            <tr style="background:#f3f5f7;color:#52606d;">
+              <th align="left" style="padding:10px;border-bottom:1px solid #d9dee5;">\u54c1\u79cd</th>
+              <th align="left" style="padding:10px;border-bottom:1px solid #d9dee5;">\u6570\u91cf / \u4ef7\u683c</th>
+              <th align="right" style="padding:10px;border-bottom:1px solid #d9dee5;">\u5e02\u503c / \u76c8\u4e8f</th>
+            </tr>
+            <tr>
+              <td style="padding:12px 10px;border-bottom:1px solid #e7eaee;"><strong>{escape(str(portfolio_report['fund_name']))}</strong><br><span style="color:#7b8794;">{escape(str(portfolio_report['fund_code']))}</span></td>
+              <td style="padding:12px 10px;border-bottom:1px solid #e7eaee;line-height:1.6;">{fund_detail}</td>
+              <td align="right" style="padding:12px 10px;border-bottom:1px solid #e7eaee;line-height:1.6;">{fund_metrics}</td>
+            </tr>
+            <tr>
+              <td style="padding:12px 10px;"><strong>\u5de5\u884c\u79ef\u5b58\u91d1</strong><br><span style="color:#7b8794;">\u53c2\u8003\u4f30\u503c</span></td>
+              <td style="padding:12px 10px;line-height:1.6;">{portfolio_report['gold_grams']:.4f} \u514b<br>{portfolio_report['gold_mark']:,.2f} \u5143/\u514b</td>
+              <td align="right" style="padding:12px 10px;line-height:1.6;"><strong>{portfolio_report['gold_value']:,.2f} \u5143</strong><br><span style="color:{value_color(portfolio_report['gold_profit'])}">{portfolio_report['gold_profit']:+,.2f} \u5143 ({portfolio_report['gold_return']:+.2%})</span></td>
+            </tr>
+            <tr style="background:#fff9e8;">
+              <td colspan="2" style="padding:12px 10px;border-top:2px solid #d6b35a;"><strong>\u5408\u8ba1</strong></td>
+              <td align="right" style="padding:12px 10px;border-top:2px solid #d6b35a;line-height:1.6;">{combined_metrics}</td>
+            </tr>
+          </table>
+        """
+        action_html = f"""
+          <h2 style="margin:28px 0 10px;font-size:18px;color:#1f2933;">\u98ce\u9669\u5224\u65ad</h2>
+          <div style="padding:14px 16px;background:#edf7f3;border-left:4px solid #087f5b;line-height:1.7;color:#25313c;">
+            <strong>\u5f53\u524d\u9ec4\u91d1\u4ed3\u4f4d\uff1a{portfolio_report['allocation']:.0f}%</strong><br>
+            {escape(portfolio_report['action'])}
+          </div>
+        """
+        note_html = "<p style=\"margin:12px 0 0;color:#7b8794;font-size:12px;line-height:1.6;\">\u79ef\u5b58\u91d1\u672a\u6263\u5de5\u884c\u5b9e\u65f6\u4e70\u5356\u4ef7\u5dee\u6216\u8d39\u7528\uff0c\u5b9e\u9645\u4ea4\u6613\u4ee5\u5de5\u884c APP \u62a5\u4ef7\u4e3a\u51c6\u3002</p>"
+
+    reason_items = "".join(f"<li style=\"margin:5px 0;\">{escape(reason)}</li>" for reason in reasons)
+    news_html = ""
+    if news:
+        news_html = f"<p style=\"margin:8px 0 0;\"><a href=\"{escape(news['link'], quote=True)}\" style=\"color:#1261a0;\">{escape(news['title'])}</a><br><span style=\"color:#7b8794;\">{escape(news['published'])}</span></p>"
+    source_urls = list(quote["source_urls"])
+    if portfolio_report:
+        source_urls.append(FUND_PAGE_URL.format(code=portfolio_report["fund_code"]))
+    source_links = "".join(
+        f"<li style=\"margin:5px 0;word-break:break-all;\"><a href=\"{escape(url, quote=True)}\" style=\"color:#1261a0;\">{escape(url)}</a></li>"
+        for url in source_urls
+    )
+
+    return f"""<!doctype html>
+<html><body style="margin:0;padding:0;background:#eef1f4;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',Arial,sans-serif;color:#25313c;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#eef1f4;"><tr><td align="center" style="padding:20px 10px;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:680px;background:#ffffff;border-top:5px solid #c99a2e;">
+      <tr><td style="padding:24px 24px 18px;background:#202a33;color:#ffffff;">
+        <div style="font-size:13px;color:#d6dde4;">{escape(quote['instrument'])}{estimate_note}</div>
+        <div style="margin-top:6px;font-size:34px;font-weight:700;line-height:1.2;">{quote['price']:,.2f} <span style="font-size:17px;font-weight:400;">\u5143/\u514b</span></div>
+        <div style="margin-top:10px;color:{change_color};font-size:16px;font-weight:600;">{change_value}&nbsp;&nbsp;{change_percent}</div>
+      </td></tr>
+      <tr><td style="padding:22px 24px 28px;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="font-size:13px;color:#52606d;line-height:1.7;">
+          <tr><td style="padding:3px 0;">\u68c0\u67e5\u65f6\u95f4</td><td align="right" style="padding:3px 0;color:#25313c;">{escape(timestamp)}</td></tr>
+          <tr><td style="padding:3px 0;">\u6570\u636e\u65f6\u95f4</td><td align="right" style="padding:3px 0;color:#25313c;">{escape(str(quote['market_time']))}</td></tr>
+          <tr><td style="padding:3px 0;">\u6570\u636e\u6765\u6e90</td><td align="right" style="padding:3px 0;color:#25313c;">{escape(quote['source'])}</td></tr>
+        </table>
+        {holdings_html}
+        {action_html}
+        <h2 style="margin:28px 0 10px;font-size:18px;color:#1f2933;">\u672c\u6b21\u90ae\u4ef6\u539f\u56e0</h2>
+        <ul style="margin:0;padding:12px 16px 12px 34px;background:#f6f7f9;line-height:1.6;">{reason_items}</ul>
+        {news_html}
+        <h2 style="margin:28px 0 10px;font-size:18px;color:#1f2933;">\u6570\u636e\u94fe\u63a5</h2>
+        <ul style="margin:0;padding-left:20px;font-size:12px;line-height:1.5;">{source_links}</ul>
+        {note_html}
+      </td></tr>
+    </table>
+  </td></tr></table>
+</body></html>"""
+
+
+def send_email(subject, body, html_body=None):
     email_address = os.environ["QQ_EMAIL"]
     authorization_code = os.environ["QQ_SMTP_AUTH_CODE"]
 
@@ -294,6 +445,8 @@ def send_email(subject, body):
     message["To"] = email_address
     message["Subject"] = str(Header(subject, "utf-8"))
     message.set_content(body)
+    if html_body:
+        message.add_alternative(html_body, subtype="html")
 
     context = ssl.create_default_context()
     with smtplib.SMTP_SSL("smtp.qq.com", 465, context=context, timeout=30) as smtp:
@@ -409,7 +562,16 @@ def main():
             )
         else:
             subject = f"[\u91d1\u4ef7\u9884\u8b66] {current_price:.2f} \u5143/\u514b"
-        send_email(subject, body)
+        html_body = build_email_html(
+            quote,
+            change,
+            change_ratio,
+            timestamp,
+            portfolio_report,
+            reasons,
+            news if is_news_alert else None,
+        )
+        send_email(subject, body, html_body)
         print("QQ Mail notification sent.")
 
     write_outputs(
@@ -434,4 +596,3 @@ if __name__ == "__main__":
     except Exception as error:
         print(f"Monitor failed: {error}", file=sys.stderr)
         raise
-
