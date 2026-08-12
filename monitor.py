@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 SGE_URL = "https://www.sge.com.cn/sjzx/yshqbg?ad_check=1"
 GOLD_API_USD_URL = "https://api.gold-api.com/price/XAU"
 GOLD_API_CNY_URL = "https://api.gold-api.com/price/XAU/CNY"
+FUND_PAGE_URL = "https://fund.eastmoney.com/{code}.html"
 NEWS_URL = (
     "https://news.google.com/rss/search?"
     + urllib.parse.urlencode(
@@ -127,6 +128,132 @@ def fetch_quote():
         return fetch_estimated_price()
 
 
+def load_portfolio():
+    raw = os.environ.get("PORTFOLIO_JSON", "").strip()
+    if not raw:
+        return None
+    portfolio = json.loads(raw)
+    required = (
+        "fund_code",
+        "fund_name",
+        "fund_shares",
+        "fund_cost_nav",
+        "gold_grams",
+        "gold_cost_per_gram",
+        "gold_allocation_pct",
+        "max_loss_pct",
+        "risk_profile",
+    )
+    missing = [key for key in required if key not in portfolio]
+    if missing:
+        raise RuntimeError(f"Portfolio configuration is missing: {', '.join(missing)}")
+    return portfolio
+
+
+def fetch_fund_nav(code):
+    url = FUND_PAGE_URL.format(code=code)
+    html = fetch_bytes(url).decode("utf-8", errors="replace")
+    text = unescape(re.sub(r"<[^>]+>", " ", html))
+    text = re.sub(r"\s+", " ", text)
+    patterns = (
+        r"\u5355\u4f4d\u51c0\u503c\s*\((\d{4}-\d{2}-\d{2})\)\s*([0-9]+(?:\.[0-9]+)?)",
+        r"\u5355\u4f4d\u51c0\u503c\s*\((\d{2}-\d{2})\)\s*[\uff1a:]\s*([0-9]+(?:\.[0-9]+)?)",
+    )
+    match = next((re.search(pattern, text) for pattern in patterns if re.search(pattern, text)), None)
+    if not match:
+        raise RuntimeError(f"Latest NAV for fund {code} was not found")
+    nav = float(match.group(2))
+    if not 0.1 <= nav <= 100:
+        raise RuntimeError(f"Fund {code} returned an implausible NAV: {nav}")
+    return {"nav": nav, "date": match.group(1), "url": url}
+
+
+def build_portfolio_report(portfolio, quote):
+    try:
+        fund = fetch_fund_nav(str(portfolio["fund_code"]))
+    except Exception as error:
+        fund = None
+        print(f"Fund NAV check failed: {error}", file=sys.stderr)
+    fund_shares = float(portfolio["fund_shares"])
+    fund_cost_nav = float(portfolio["fund_cost_nav"])
+    gold_grams = float(portfolio["gold_grams"])
+    gold_cost_per_gram = float(portfolio["gold_cost_per_gram"])
+    allocation = float(portfolio["gold_allocation_pct"])
+    max_loss = float(portfolio["max_loss_pct"])
+
+    fund_cost = fund_shares * fund_cost_nav
+    fund_value = fund_shares * fund["nav"] if fund else None
+    fund_profit = fund_value - fund_cost if fund_value is not None else None
+    fund_return = fund_profit / fund_cost if fund_profit is not None else None
+
+    # ICBC's public web quote is not reliably machine-readable. Use the monitored
+    # Au99.99/estimated CNY price as an indicative mark and label it clearly.
+    gold_mark = quote["price"]
+    gold_cost = gold_grams * gold_cost_per_gram
+    gold_value = gold_grams * gold_mark
+    gold_profit = gold_value - gold_cost
+    gold_return = gold_profit / gold_cost
+    combined_cost = fund_cost + gold_cost
+    combined_value = fund_value + gold_value if fund_value is not None else None
+    combined_profit = combined_value - combined_cost if combined_value is not None else None
+    combined_return = combined_profit / combined_cost if combined_profit is not None else None
+
+    if allocation >= 40:
+        action = (
+            "\u9ec4\u91d1\u5360\u53ef\u6295\u8d44\u8d44\u4ea7\u7ea6 "
+            f"{allocation:.0f}%\uff0c\u4e0e\u7a33\u5065\u578b\u548c\u6700\u5927\u53ef\u63a5\u53d7\u4e8f\u635f "
+            f"{max_loss:.0f}% \u4e0d\u592a\u5339\u914d\uff1a\u6682\u505c\u52a0\u4ed3\uff0c\u4f18\u5148\u6301\u6709\u6216\u5206\u6279\u964d\u4f4e\u96c6\u4e2d\u5ea6\u3002"
+        )
+    elif combined_return is not None and combined_return <= -(max_loss / 100):
+        action = (
+            f"\u5408\u8ba1\u4e8f\u635f\u5df2\u8fbe\u4f60\u8bbe\u5b9a\u7684 {max_loss:.0f}% \u4e0a\u9650\uff1a"
+            "\u505c\u6b62\u52a0\u4ed3\uff0c\u68c0\u67e5\u6301\u4ed3\u662f\u5426\u9700\u8981\u5206\u6279\u964d\u4f4e\u3002"
+        )
+    else:
+        action = "\u4ed3\u4f4d\u672a\u89e6\u53d1\u98ce\u9669\u7ebf\uff1a\u4ee5\u6301\u6709\u89c2\u5bdf\u4e3a\u4e3b\uff0c\u907f\u514d\u8ffd\u6da8\u3002"
+
+    fund_line = (
+        (
+            f"{portfolio['fund_name']} ({portfolio['fund_code']})\uff1a"
+            f"\u51c0\u503c {fund['nav']:.4f} ({fund['date']})\uff0c"
+            f"\u5e02\u503c {fund_value:.2f} \u5143\uff0c"
+            f"\u6d6e\u52a8\u76c8\u4e8f {fund_profit:+.2f} \u5143 ({fund_return:+.2%})"
+        )
+        if fund
+        else (
+            f"{portfolio['fund_name']} ({portfolio['fund_code']})\uff1a"
+            "\u672c\u8f6e\u672a\u53d6\u5230\u6700\u65b0\u51c0\u503c\uff0c\u6682\u4e0d\u4f30\u7b97\u57fa\u91d1\u76c8\u4e8f\u3002"
+        )
+    )
+    lines = [
+        "\u6301\u4ed3\u53c2\u8003\uff08\u4ec5\u4f9b\u98ce\u9669\u7ba1\u7406\uff09\uff1a",
+        fund_line,
+        (
+            f"\u5de5\u884c\u79ef\u5b58\u91d1\uff1a{gold_grams:.4f} \u514b\uff0c"
+            f"\u6309\u76d1\u63a7\u91d1\u4ef7 {gold_mark:.2f} \u5143/\u514b\u4f30\u7b97\uff0c"
+            f"\u6d6e\u52a8\u76c8\u4e8f {gold_profit:+.2f} \u5143 ({gold_return:+.2%})"
+        ),
+        (
+            f"\u5408\u8ba1\uff1a\u4f30\u7b97\u5e02\u503c {combined_value:.2f} \u5143\uff0c"
+            f"\u6d6e\u52a8\u76c8\u4e8f {combined_profit:+.2f} \u5143 ({combined_return:+.2%})"
+            if combined_value is not None
+            else "\u5408\u8ba1\uff1a\u57fa\u91d1\u51c0\u503c\u7f3a\u5931\uff0c\u672c\u8f6e\u4e0d\u8ba1\u7b97\u5408\u8ba1\u76c8\u4e8f\u3002"
+        ),
+        f"\u53c2\u8003\u5224\u65ad\uff1a{action}",
+        (
+            "\u6ce8\uff1a\u79ef\u5b58\u91d1\u4e3a\u53c2\u8003\u4f30\u503c\uff0c\u672a\u6263\u5de5\u884c\u5b9e\u65f6\u4e70\u5356\u4ef7\u5dee\u6216\u8d39\u7528\uff1b"
+            "\u5b9e\u9645\u4ea4\u6613\u4ee5\u5de5\u884c APP \u62a5\u4ef7\u4e3a\u51c6\u3002"
+        ),
+        f"\u57fa\u91d1\u51c0\u503c\u6765\u6e90\uff1a{FUND_PAGE_URL.format(code=portfolio['fund_code'])}",
+    ]
+    return {
+        "text": "\n".join(lines),
+        "combined_return": combined_return,
+        "allocation": allocation,
+        "action": action,
+    }
+
+
 def fetch_important_news(now):
     root = ET.fromstring(fetch_bytes(NEWS_URL))
     cutoff = now.astimezone(ZoneInfo("UTC")) - timedelta(hours=1, minutes=10)
@@ -198,6 +325,14 @@ def main():
     )
     force_test = os.environ.get("FORCE_TEST_EMAIL", "false").lower() == "true"
 
+    portfolio_report = None
+    try:
+        portfolio = load_portfolio()
+        if portfolio:
+            portfolio_report = build_portfolio_report(portfolio, quote)
+    except Exception as error:
+        print(f"Portfolio check failed without stopping price monitoring: {error}", file=sys.stderr)
+
     news = None
     try:
         news = fetch_important_news(now)
@@ -233,6 +368,8 @@ def main():
         f"{quote_detail}\n"
         f"{source_lines}"
     )
+    if portfolio_report:
+        summary = f"{summary}\n\n{portfolio_report['text']}"
     print(summary)
 
     reasons = []
