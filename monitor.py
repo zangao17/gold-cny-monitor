@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import os
 import re
 import smtplib
@@ -32,6 +33,7 @@ NEWS_URL = (
     )
 )
 ALERT_THRESHOLD = 0.005
+STATE_VERSION = 2
 TROY_OUNCE_GRAMS = 31.1034768
 IMPORTANT_NEWS_TERMS = (
     "federal reserve",
@@ -53,6 +55,231 @@ IMPORTANT_NEWS_TERMS = (
     "\u66b4\u6da8",
     "\u66b4\u8dcc",
 )
+
+
+def initial_monitor_state():
+    return {
+        "version": STATE_VERSION,
+        "sources": {},
+        "sge_session": {"date": None, "up_bucket": 0, "down_bucket": 0},
+        "last_news_id": "",
+        "last_portfolio_risk": "",
+    }
+
+
+def _legacy_monitor_state():
+    state = initial_monitor_state()
+    legacy_price = _safe_float(os.environ.get("LAST_PRICE", "").strip())
+    legacy_source = os.environ.get("LAST_SOURCE_KIND", "").strip()
+    if legacy_price is not None and legacy_source:
+        state["sources"][legacy_source] = {
+            "last_price": legacy_price,
+            "anchor_price": legacy_price,
+        }
+    state["last_news_id"] = os.environ.get("LAST_NEWS_ID", "").strip()
+    state["last_portfolio_risk"] = os.environ.get("LAST_PORTFOLIO_RISK", "").strip()
+    return state
+
+
+def load_monitor_state():
+    path = os.environ.get("STATE_FILE", "state/monitor_state.json")
+    try:
+        with open(path, encoding="utf-8") as source:
+            state = json.load(source)
+    except FileNotFoundError:
+        return _legacy_monitor_state()
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"State file is unavailable; using legacy state: {error}", file=sys.stderr)
+        return _legacy_monitor_state()
+
+    if not isinstance(state, dict) or state.get("version") != STATE_VERSION:
+        print("State file version is unsupported; using legacy state.", file=sys.stderr)
+        return _legacy_monitor_state()
+
+    state.setdefault("sources", {})
+    state.setdefault("sge_session", {"date": None, "up_bucket": 0, "down_bucket": 0})
+    state.setdefault("last_news_id", "")
+    state.setdefault("last_portfolio_risk", "")
+    return state
+
+
+def save_monitor_state(state):
+    path = os.environ.get("STATE_FILE", "state/monitor_state.json")
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    temporary_path = f"{path}.tmp"
+    with open(temporary_path, "w", encoding="utf-8") as destination:
+        json.dump(state, destination, ensure_ascii=False, sort_keys=True)
+    os.replace(temporary_path, path)
+
+
+def _state_date_key(now):
+    return now.date().isoformat()
+
+
+def _safe_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _change_ratio(current, previous):
+    if previous in (None, 0):
+        return None
+    return (current - previous) / previous
+
+
+def _sge_bucket_index(change_ratio):
+    if change_ratio is None or abs(change_ratio) < ALERT_THRESHOLD:
+        return 0
+    magnitude = int(math.floor(abs(change_ratio) / ALERT_THRESHOLD + 1e-12))
+    if magnitude <= 0:
+        return 0
+    return magnitude if change_ratio > 0 else -magnitude
+
+
+def sge_session_buckets(state, quote, now):
+    open_price = _safe_float(quote.get("open_price"))
+    if quote.get("source_kind") != "sge" or open_price in (None, 0):
+        return {
+            "applies": False,
+            "date": _state_date_key(now),
+            "open_price": open_price,
+            "current_bucket": 0,
+            "up_bucket": 0,
+            "down_bucket": 0,
+            "reasons": [],
+        }
+
+    current_price = _safe_float(quote.get("price"))
+    if current_price is None:
+        return {
+            "applies": False,
+            "date": _state_date_key(now),
+            "open_price": open_price,
+            "current_bucket": 0,
+            "up_bucket": 0,
+            "down_bucket": 0,
+            "reasons": [],
+        }
+
+    change_ratio = _change_ratio(current_price, open_price)
+    current_bucket = _sge_bucket_index(change_ratio)
+    up_bucket = current_bucket if current_bucket > 0 else 0
+    down_bucket = current_bucket if current_bucket < 0 else 0
+    reasons = []
+    session_state = state.get("sge_session", {}) if isinstance(state, dict) else {}
+    if session_state.get("date") == _state_date_key(now):
+        stored_up = int(session_state.get("up_bucket", 0) or 0)
+        stored_down = int(session_state.get("down_bucket", 0) or 0)
+    else:
+        stored_up = 0
+        stored_down = 0
+
+    if up_bucket > stored_up:
+        reasons.append(
+            f"涓婇噾鎵€ Au99.99 杈冧粖寮€鐩樹笂娑?{change_ratio:+.2%}锛岃繘鍏ョ {up_bucket} 妗?
+        )
+    if down_bucket < stored_down:
+        reasons.append(
+            f"涓婇噾鎵€ Au99.99 杈冧粖寮€鐩樹笅璺?{change_ratio:+.2%}锛岃繘鍏ョ {abs(down_bucket)} 妗?
+        )
+
+    return {
+        "applies": True,
+        "date": _state_date_key(now),
+        "open_price": open_price,
+        "current_bucket": current_bucket,
+        "up_bucket": up_bucket,
+        "down_bucket": down_bucket,
+        "reasons": reasons,
+    }
+
+
+def apply_sge_session_buckets(state, session_buckets, now):
+    if not session_buckets or not session_buckets.get("applies"):
+        return None
+
+    session_state = state.setdefault(
+        "sge_session", {"date": None, "up_bucket": 0, "down_bucket": 0}
+    )
+    current_date = session_buckets.get("date") or _state_date_key(now)
+    if session_state.get("date") != current_date:
+        session_state["date"] = current_date
+        session_state["up_bucket"] = 0
+        session_state["down_bucket"] = 0
+
+    up_bucket = int(session_buckets.get("up_bucket", 0) or 0)
+    down_bucket = int(session_buckets.get("down_bucket", 0) or 0)
+    if up_bucket > session_state.get("up_bucket", 0):
+        session_state["up_bucket"] = up_bucket
+    if down_bucket < session_state.get("down_bucket", 0):
+        session_state["down_bucket"] = down_bucket
+
+    return None
+
+
+def evaluate_price_alert(state, quote, now):
+    source = quote["source_kind"]
+    current_price = _safe_float(quote.get("price"))
+    session_buckets = sge_session_buckets(state, quote, now)
+    record = (state.get("sources") or {}).get(source)
+    if record is None:
+        return {
+            "should_alert": bool(session_buckets["reasons"]),
+            "reasons": list(session_buckets["reasons"]),
+            "source": source,
+            "price": current_price,
+            "initialize_source": True,
+            "session_buckets": session_buckets,
+            "previous_price": None,
+            "change": None,
+            "change_ratio": None,
+        }
+
+    reasons = list(session_buckets["reasons"])
+    last_price = _safe_float(record.get("last_price"))
+    anchor_price = _safe_float(record.get("anchor_price", last_price))
+    last_ratio = _change_ratio(current_price, last_price)
+    anchor_ratio = _change_ratio(current_price, anchor_price)
+    if last_ratio is not None and abs(last_ratio) >= ALERT_THRESHOLD:
+        reasons.append(f"鍚屾簮涓婃妫€鏌ュ彉鍖?{last_ratio:+.2%}")
+    if anchor_ratio is not None and abs(anchor_ratio) >= ALERT_THRESHOLD:
+        reasons.append(f"鍚屾簮绱鍙樺寲 {anchor_ratio:+.2%}")
+
+    return {
+        "should_alert": bool(reasons),
+        "reasons": reasons,
+        "source": source,
+        "price": current_price,
+        "initialize_source": False,
+        "session_buckets": session_buckets,
+        "previous_price": last_price,
+        "change": current_price - last_price if last_price is not None else None,
+        "change_ratio": last_ratio,
+    }
+
+
+def commit_price_state(state, decision, now):
+    sources = state.setdefault("sources", {})
+    source = decision["source"]
+    record = sources.setdefault(source, {})
+    record["last_price"] = decision["price"]
+    record["last_checked_at"] = now.isoformat()
+
+    if decision.get("initialize_source") or decision.get("should_alert"):
+        record["anchor_price"] = decision["price"]
+        record["anchor_checked_at"] = now.isoformat()
+
+    apply_sge_session_buckets(state, decision.get("session_buckets"), now)
+    return state
+
+
+def deliver_alert_and_commit(state, decision, now, send):
+    send()
+    return commit_price_state(state, decision, now)
 
 
 def fetch_bytes(url, timeout=25):
@@ -77,15 +304,21 @@ def fetch_sge_price():
     html = fetch_bytes(SGE_URL).decode("utf-8", errors="replace")
     text = unescape(re.sub(r"<[^>]+>", " ", html))
     text = re.sub(r"\s+", " ", text)
-    price_match = re.search(r"Au99\.99\s*\|?\s*([0-9]+(?:\.[0-9]+)?)", text)
+    row_match = re.search(
+        r"Au99\.99\s*(?:\|\s*)?([0-9]+(?:\.[0-9]+)?)\s*"
+        r"(?:\|\s*)?([0-9]+(?:\.[0-9]+)?)\s*"
+        r"(?:\|\s*)?([0-9]+(?:\.[0-9]+)?)\s*"
+        r"(?:\|\s*)?([0-9]+(?:\.[0-9]+)?)",
+        text,
+    )
     date_match = re.search(
         r"(\d{4})\u5e74(\d{2})\u6708(\d{2})\u65e5\u5ef6\u65f6\u884c\u60c5",
         text,
     )
-    if not price_match:
+    if not row_match:
         raise RuntimeError("Au99.99 was not found on the SGE delayed quote page")
 
-    price = float(price_match.group(1))
+    price = float(row_match.group(1))
     if not 100 <= price <= 3000:
         raise RuntimeError(f"SGE returned an implausible Au99.99 price: {price}")
     return {
@@ -96,6 +329,9 @@ def fetch_sge_price():
         "source": "Shanghai Gold Exchange delayed quote",
         "source_urls": [SGE_URL],
         "estimated": False,
+        "high_price": float(row_match.group(2)),
+        "low_price": float(row_match.group(3)),
+        "open_price": float(row_match.group(4)),
     }
 
 
@@ -505,20 +741,13 @@ def main():
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
     quote = fetch_quote(now)
     current_price = quote["price"]
-    previous_price_text = os.environ.get("LAST_PRICE", "").strip()
-    previous_source = os.environ.get("LAST_SOURCE_KIND", "").strip()
-    previous_news_id = os.environ.get("LAST_NEWS_ID", "").strip()
-    previous_portfolio_risk = os.environ.get("LAST_PORTFOLIO_RISK", "").strip()
-    previous_price = float(previous_price_text) if previous_price_text else None
-    source_changed = bool(previous_source and previous_source != quote["source_kind"])
-
-    change = current_price - previous_price if previous_price is not None else None
-    change_ratio = change / previous_price if previous_price else None
-    is_price_alert = (
-        change_ratio is not None
-        and not source_changed
-        and abs(change_ratio) >= ALERT_THRESHOLD
-    )
+    state = load_monitor_state()
+    price_decision = evaluate_price_alert(state, quote, now)
+    previous_news_id = state["last_news_id"]
+    previous_portfolio_risk = state["last_portfolio_risk"]
+    change = price_decision["change"]
+    change_ratio = price_decision["change_ratio"]
+    is_price_alert = price_decision["should_alert"]
     force_test = os.environ.get("FORCE_TEST_EMAIL", "false").lower() == "true"
 
     portfolio_report = None
@@ -545,11 +774,6 @@ def main():
     estimate_note = " (\u4f30\u7b97)" if quote["estimated"] else ""
     if change is None:
         change_text = "\u53d8\u52a8\uff1a\u9996\u6b21\u4e91\u7aef\u68c0\u67e5\uff0c\u6682\u65e0\u4e0a\u6b21\u4ef7\u683c\u3002"
-    elif source_changed:
-        change_text = (
-            f"\u53d8\u52a8\uff1a{change:+.2f} \u5143/\u514b ({change_ratio:+.2%})\uff1b"
-            "\u6570\u636e\u6e90\u53d1\u751f\u53d8\u5316\uff0c\u672c\u6b21\u4e0d\u89e6\u53d1\u4ef7\u683c\u9884\u8b66\u3002"
-        )
     else:
         change_text = f"\u53d8\u52a8\uff1a{change:+.2f} \u5143/\u514b ({change_ratio:+.2%})"
 
@@ -575,11 +799,7 @@ def main():
         summary = f"{summary}\n\n{portfolio_report['text']}"
     print(summary)
 
-    reasons = []
-    if is_price_alert:
-        reasons.append(
-            f"\u4ef7\u683c\u53d8\u52a8 {change_ratio:+.2%}\uff0c\u5df2\u8fbe\u5230 0.5% \u9608\u503c"
-        )
+    reasons = list(price_decision["reasons"])
     if is_news_alert:
         reasons.append(f"\u91cd\u8981\u9ec4\u91d1\u5e02\u573a\u65b0\u95fb\uff1a{news['title']}")
     if is_portfolio_alert:
@@ -611,19 +831,30 @@ def main():
             reasons,
             news if is_news_alert else None,
         )
-        send_email(subject, body, html_body)
+        deliver_alert_and_commit(
+            state,
+            price_decision,
+            now,
+            lambda: send_email(subject, body, html_body),
+        )
+        if news:
+            state["last_news_id"] = news["id"]
+        if portfolio_report:
+            state["last_portfolio_risk"] = portfolio_report["risk_code"]
+        save_monitor_state(state)
         print("QQ Mail notification sent.")
+    else:
+        commit_price_state(state, price_decision, now)
+        if portfolio_report:
+            state["last_portfolio_risk"] = portfolio_report["risk_code"]
+        save_monitor_state(state)
 
     write_outputs(
         {
             "price": f"{current_price:.2f}",
             "source_kind": quote["source_kind"],
-            "news_id": news["id"] if news else previous_news_id,
-            "portfolio_risk": (
-                portfolio_report["risk_code"]
-                if portfolio_report
-                else previous_portfolio_risk
-            ),
+            "news_id": state["last_news_id"],
+            "portfolio_risk": state["last_portfolio_risk"],
             "alert": str(is_price_alert or is_news_alert or is_portfolio_alert).lower(),
             "checked_at": now.isoformat(),
         }
