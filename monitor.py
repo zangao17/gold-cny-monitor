@@ -6,6 +6,7 @@ import re
 import smtplib
 import ssl
 import sys
+import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -282,7 +283,7 @@ def deliver_alert_and_commit(state, decision, now, send):
     return commit_price_state(state, decision, now)
 
 
-def fetch_bytes(url, timeout=25):
+def fetch_bytes(url, timeout=10, attempts=3, retry_delay_seconds=1):
     request = urllib.request.Request(
         url,
         headers={
@@ -292,8 +293,15 @@ def fetch_bytes(url, timeout=25):
             )
         },
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read()
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read()
+        except OSError:
+            if attempt == attempts:
+                raise
+            if retry_delay_seconds:
+                time.sleep(retry_delay_seconds)
 
 
 def fetch_json(url):
