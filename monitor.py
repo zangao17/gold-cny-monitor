@@ -180,11 +180,11 @@ def sge_session_buckets(state, quote, now):
 
     if up_bucket > stored_up:
         reasons.append(
-            f"涓婇噾鎵€ Au99.99 杈冧粖寮€鐩樹笂娑?{change_ratio:+.2%}锛岃繘鍏ョ {up_bucket} 妗?
+            f"上金所 Au99.99 较今开盘上涨 {change_ratio:+.2%}，进入第 {up_bucket} 档"
         )
     if down_bucket < stored_down:
         reasons.append(
-            f"涓婇噾鎵€ Au99.99 杈冧粖寮€鐩樹笅璺?{change_ratio:+.2%}锛岃繘鍏ョ {abs(down_bucket)} 妗?
+            f"上金所 Au99.99 较今开盘下跌 {change_ratio:+.2%}，进入第 {abs(down_bucket)} 档"
         )
 
     return {
@@ -245,9 +245,9 @@ def evaluate_price_alert(state, quote, now):
     last_ratio = _change_ratio(current_price, last_price)
     anchor_ratio = _change_ratio(current_price, anchor_price)
     if last_ratio is not None and abs(last_ratio) >= ALERT_THRESHOLD:
-        reasons.append(f"鍚屾簮涓婃妫€鏌ュ彉鍖?{last_ratio:+.2%}")
+        reasons.append(f"同源上次检查变化 {last_ratio:+.2%}")
     if anchor_ratio is not None and abs(anchor_ratio) >= ALERT_THRESHOLD:
-        reasons.append(f"鍚屾簮绱鍙樺寲 {anchor_ratio:+.2%}")
+        reasons.append(f"同源累计变化 {anchor_ratio:+.2%}")
 
     return {
         "should_alert": bool(reasons),
