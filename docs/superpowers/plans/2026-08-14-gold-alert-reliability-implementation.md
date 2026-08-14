@@ -42,7 +42,7 @@ class AlertEvaluationTests(unittest.TestCase):
         )
         decision = monitor.evaluate_price_alert(state, quote(994, "international_estimate"), NOW)
         self.assertTrue(decision["should_alert"])
-        self.assertIn("绱", "锛?.join(decision["reasons"]))
+        self.assertIn("累计", "；".join(decision["reasons"]))
 
     def test_sge_source_switch_uses_sge_history_instead_of_suppressing_alert(self):
         state = monitor.initial_monitor_state()
@@ -87,9 +87,9 @@ def evaluate_price_alert(state, quote, now):
     last_ratio = (current - record["last_price"]) / record["last_price"]
     anchor_ratio = (current - record["anchor_price"]) / record["anchor_price"]
     if abs(last_ratio) >= ALERT_THRESHOLD:
-        reasons.append(f"鍚屾簮涓婃妫€鏌ュ彉鍖?{last_ratio:+.2%}")
+        reasons.append(f"同源上次检查变化 {last_ratio:+.2%}")
     if abs(anchor_ratio) >= ALERT_THRESHOLD:
-        reasons.append(f"鍚屾簮绱鍙樺寲 {anchor_ratio:+.2%}")
+        reasons.append(f"同源累计变化 {anchor_ratio:+.2%}")
     session_buckets = sge_session_buckets(state, quote, now)
     reasons.extend(session_buckets["reasons"])
     return {"should_alert": bool(reasons), "reasons": reasons, "source": source,
@@ -165,9 +165,9 @@ def test_price_state_is_not_committed_when_email_send_raises(self):
     self.assertEqual(state["sources"], {})
 
 def test_email_reasons_include_sge_open_move(self):
-    reasons = ["涓婇噾鎵€ Au99.99 杈冧粖寮€鐩樹笅璺?-1.97%"]
+    reasons = ["上金所 Au99.99 较今开盘下跌 -1.97%"]
     html = monitor.build_email_html(quote(936.2, "sge", 955), -18.8, -0.0197, "time", None, reasons, None)
-    self.assertIn("杈冧粖寮€鐩?, html)
+    self.assertIn("较今开盘", html)
 
 def test_legacy_price_environment_migrates_to_state(self):
     with patch.dict(os.environ, {"LAST_PRICE": "947.84", "LAST_SOURCE_KIND": "international_estimate"}, clear=True):
@@ -313,7 +313,7 @@ Create `publish-gold-monitor.ps1` using the working `gh api` pattern. It must up
 
 - [ ] **Step 2: Publish and run a forced cloud email test**
 
-Run: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Users\HP\Desktop\瀛︿範agent\publish-gold-monitor.ps1"`
+Run: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Users\HP\Desktop\学习agent\publish-gold-monitor.ps1"`
 
 Expected: all listed files report published; `gh workflow run gold-monitor.yml --repo zangao17/gold-cny-monitor -f send_test_email=true` starts; GitHub run ends successfully; QQ Mail receives one formatted test message.
 
