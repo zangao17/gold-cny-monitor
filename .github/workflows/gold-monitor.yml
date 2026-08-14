@@ -2,7 +2,7 @@ name: Gold CNY monitor
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "2,32 * * * *"
   workflow_dispatch:
     inputs:
       send_test_email:
@@ -28,6 +28,7 @@ jobs:
       QQ_SMTP_AUTH_CODE: ${{ secrets.QQ_SMTP_AUTH_CODE }}
       PORTFOLIO_JSON: ${{ secrets.PORTFOLIO_JSON }}
       FORCE_TEST_EMAIL: ${{ inputs.send_test_email || 'false' }}
+      STATE_FILE: state/monitor_state.json
 
     steps:
       - name: Check out monitor
@@ -58,7 +59,7 @@ jobs:
             });
             require("fs").writeFileSync("state.zip", Buffer.from(archive.data));
 
-      - name: Load previous state
+      - name: Load previous state for migration
         shell: bash
         run: |
           set -euo pipefail
@@ -82,19 +83,6 @@ jobs:
       - name: Check price and notify
         id: monitor
         run: python monitor.py
-
-      - name: Prepare latest state
-        env:
-          CURRENT_PRICE: ${{ steps.monitor.outputs.price }}
-          CURRENT_SOURCE_KIND: ${{ steps.monitor.outputs.source_kind }}
-          CURRENT_NEWS_ID: ${{ steps.monitor.outputs.news_id }}
-          CURRENT_PORTFOLIO_RISK: ${{ steps.monitor.outputs.portfolio_risk }}
-        shell: bash
-        run: |
-          printf '%s' "$CURRENT_PRICE" > state/last_price.txt
-          printf '%s' "$CURRENT_SOURCE_KIND" > state/last_source_kind.txt
-          printf '%s' "$CURRENT_NEWS_ID" > state/last_news_id.txt
-          printf '%s' "$CURRENT_PORTFOLIO_RISK" > state/last_portfolio_risk.txt
 
       - name: Save price for the next run
         uses: actions/upload-artifact@v4
@@ -122,4 +110,3 @@ jobs:
                 artifact_id: artifact.id,
               });
             }
-
